@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Callable, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -51,10 +51,12 @@ class ContinousHead(nn.Module):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
+        self.mean = nn.Linear(self.in_dim, self.out_dim)
+        self.sigma = nn.Linear(self.in_dim, self.out_dim)
 
     def forward(self, x: torch.Tensor) -> Distribution:
-        mean = nn.Linear(self.in_dim, self.out_dim)(x)
-        sigma = nn.Linear(self.in_dim, self.out_dim)(x).exp()
+        mean = self.mean(x)
+        sigma = self.sigma(x).exp()
         return Normal(mean, sigma)
 
 
@@ -71,9 +73,10 @@ class DiscreteHead(nn.Module):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
+        self.layer = nn.Linear(self.in_dim, self.out_dim)
 
     def forward(self, x: torch.Tensor) -> Distribution:
-        logits = nn.Linear(self.in_dim, self.out_dim)(x)
+        logits = self.layer(x)
         return Categorical(logits=logits)
 
 
@@ -81,44 +84,41 @@ class RLEnvironmentError(Exception):
     """Raised when the environment is not supported."""
 
 
-class Agent(nn.Module):
-    """
-    Basic agent, for implementing ppo on vector environments, with
-    discrete action spaces.
-    """
+class Actor(nn.Module):
+    """Stochastic nonlinear policy."""
 
-    def __init__(self, observation_space: gym.Space, action_space: gym.Space):
+    def __init__(
+        self,
+        observation_space: gym.Space,
+        action_space: gym.Space,
+        internal_dim: int = 64,
+    ):
         super().__init__()
-        self.internal_dim = 64
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
         match observation_space.shape:
-            case ():
+            case tuple(observation_space.shape):
                 self.input_dim = int(np.prod(observation_space.shape))
             case None:
                 raise RLEnvironmentError("Environment must have shape supported.")
 
-        self.actor: nn.Module = nn.Sequential(
-            nn.Linear(self.input_dim, self.internal_dim),
-            nn.Tanh(),
-            nn.Linear(self.internal_dim, self.internal_dim),
-            nn.Tanh(),
-            self._out_space_to_head(action_space, self.internal_dim),
-        ).to(self.device)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.critic: nn.Module = nn.Sequential(
-            nn.Linear(self.input_dim, self.internal_dim),
-            nn.Tanh(),
-            nn.Linear(self.internal_dim, self.internal_dim),
-            nn.Tanh(),
-            nn.Linear(self.internal_dim, 1),
-        ).to(self.device)
+        self.head = self._out_space_to_head(action_space)
+        self.internal_dim = internal_dim
 
-        self.actor_opt = optim.Adam(self.actor.parameters(), lr=1e-3)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=1e-3)
+        self.actor_head = self.head(
+            self.internal_dim, int(np.array(action_space.shape).prod())
+        )
+        self.actor_1 = nn.Linear(self.input_dim, self.internal_dim)
+        self.actor_2 = nn.Linear(self.internal_dim, self.internal_dim)
+
+    def forward(self, states: torch.Tensor) -> Distribution:
+        states = torch.Tensor(states).flatten().to(self.device)
+        states = F.relu(self.actor_1(states))
+        states = F.relu(self.actor_2(states))
+        return self.actor_head(states)
 
     @staticmethod
-    def _out_space_to_head(space: gym.Space, internal_dim: int) -> nn.Module:
+    def _out_space_to_head(space: gym.Space) -> Callable:
         """Returns a input layer, that maps the observation_space
         to the internal_dim.
 
@@ -138,16 +138,51 @@ class Agent(nn.Module):
             NotImplementedError: If the space is not discrete or continuous.
         """
         match space:
-            case gym.spaces.Box:
-                return ContinousHead(internal_dim, np.array(space.shape).prod())
-            case gym.spaces.Discrete:
-                return DiscreteHead(internal_dim, np.array(space.shape).prod())
+            case gym.spaces.Box():
+                return ContinousHead
+            case gym.spaces.Discrete():
+                return DiscreteHead
             case _:
+                print(space)
                 raise NotImplementedError("Only Box and Discrete spaces are supported.")
+
+
+class Agent(nn.Module):
+    """
+    Basic agent, for implementing ppo on vector environments, with
+    discrete action spaces.
+    """
+
+    def __init__(self, observation_space: gym.Space, action_space: gym.Space):
+        super().__init__()
+
+        match observation_space.shape:
+            case tuple(observation_space.shape):
+                self.input_dim = int(np.prod(observation_space.shape))
+            case None:
+                raise RLEnvironmentError("Environment must have shape supported.")
+
+        self.internal_dim = 64
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.actor = Actor(observation_space, action_space, self.internal_dim).to(
+            self.device
+        )
+
+        self.critic: nn.Module = nn.Sequential(
+            nn.Linear(self.input_dim, self.internal_dim),
+            nn.Tanh(),
+            nn.Linear(self.internal_dim, self.internal_dim),
+            nn.Tanh(),
+            nn.Linear(self.internal_dim, 1),
+        ).to(self.device)
+
+        self.actor_opt = optim.Adam(self.actor.parameters(), lr=1e-3)
+        self.critic_opt = optim.Adam(self.critic.parameters(), lr=1e-3)
 
     def forward(self, states: Any) -> Tuple[Distribution, torch.Tensor]:
         """Forward pass returns the action logits and state values."""
-        states = torch.tensor(states).to(self.device)
+        states = torch.tensor(states).flatten().to(self.device)
         state_values = self.critic(states)
         action_dist = self.actor(states)
         return action_dist, state_values
@@ -318,12 +353,14 @@ class Agent(nn.Module):
             ents = torch.zeros_like(rewards).to(agent.device)
             mask = torch.zeros_like(rewards).to(agent.device)
 
-            old_actor = deepcopy(agent.actor)
+            old_actor = deepcopy(agent.actor).to(agent.device)
 
             for timestep in range(hyp.num_timesteps):
                 actions, log_probs, values, entropy = agent.get_action(states)
                 old_log_probs = old_actor(states).log_prob(actions)
-                states, reward, done, _, _ = env_wrapper.step(actions.cpu().numpy())
+                states, reward, done, _, _ = env_wrapper.step(
+                    actions.cpu().numpy().reshape(envs.action_space.shape)
+                )
 
                 rewards[timestep] = torch.squeeze(torch.tensor(reward)).to(agent.device)
                 value_estimates[timestep] = values.squeeze().to(agent.device)
@@ -395,7 +432,9 @@ class Agent(nn.Module):
             for timestep in range(hyp.num_timesteps):
                 actions, log_probs, values, entropy = agent.get_action(states)
 
-                states, reward, done, _, _ = env_wrapper.step(actions.cpu().numpy())
+                states, reward, done, _, _ = env_wrapper.step(
+                    actions.cpu().numpy().reshape(envs.action_space.shape)
+                )
 
                 rewards[timestep] = torch.squeeze(torch.tensor(reward)).to(agent.device)
                 value_estimates[timestep] = values.squeeze().to(agent.device)
