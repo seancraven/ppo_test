@@ -108,7 +108,7 @@ class Agent(nn.Module):
             ent_coef: The entropy coefficient, for exploration encouragement.
 
         Returns:
-            advantages: Tensor of advantages: (batch_size, 1).
+            advantages: Tensor of advantages: (batch_size, timestep).
         """
         max_timestep = rewards.shape[0]
         advantages = torch.zeros_like(rewards)
@@ -132,8 +132,8 @@ class Agent(nn.Module):
     ):
         """Updates the agent's policy using gae actor critic.
         Args:
-            advantages: Tensor of advantages: (batch_size, 1).
-            action_log_probs: Tensor of log probabilities of the actions: (batch_size).
+            advantages: Tensor of advantages: (batch_size, timestep).
+            action_log_probs: Tensor of log probabilities of the actions: (batch_size, timestep).
 
         """
 
@@ -142,9 +142,7 @@ class Agent(nn.Module):
         square_td_errors.backward()
         self.critic_opt.step()
 
-        # reset gradients.
         self.actor_opt.zero_grad()
-        # Semi-gradient update for actor network
         actor_loss = (
             -(advantages.detach() * action_log_probs).mean() - ent_coef * entropy
         )
@@ -178,8 +176,6 @@ class Agent(nn.Module):
 
         ratio = torch.exp(action_log_probs - old_log_probs)
         clipped_ratio = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
-
-        # Get min actross each env.
         actor_loss = -(
             torch.stack(
                 (advantages.detach() * clipped_ratio, advantages.detach() * ratio),
@@ -197,6 +193,7 @@ class Agent(nn.Module):
     def ppo_train(
         env_name: str,
         hyp: PPOHyperParameters,
+        fname: str = "",
         **env_kwargs,
     ) -> nn.Module:
         """Trains an agent using PPO. Saves returns and entropy.
@@ -228,9 +225,9 @@ class Agent(nn.Module):
             rewards = torch.zeros((hyp.num_timesteps, hyp.num_envs)).to(agent.device)
             value_estimates = torch.zeros_like(rewards).to(agent.device)
             action_log_probs = torch.zeros_like(rewards).to(agent.device)
+            old_action_log_probs = torch.zeros_like(rewards).to(agent.device)
             ents = torch.zeros_like(rewards).to(agent.device)
             mask = torch.zeros_like(rewards).to(agent.device)
-            old_action_log_probs = torch.zeros_like(rewards).to(agent.device)
 
             old_actor = deepcopy(agent.actor)
 
@@ -239,14 +236,14 @@ class Agent(nn.Module):
                 old_log_probs = Categorical(
                     logits=old_actor(torch.Tensor(states).to(agent.device))
                 ).log_prob(actions)
+
                 states, reward, done, _, _ = env_wrapper.step(actions.cpu().numpy())
 
-                ents[timestep] = entropy.to(agent.device)
+                rewards[timestep] = torch.squeeze(torch.tensor(reward)).to(agent.device)
                 value_estimates[timestep] = values.squeeze().to(agent.device)
                 action_log_probs[timestep] = log_probs.to(agent.device)
                 old_action_log_probs[timestep] = old_log_probs.to(agent.device)
-
-                rewards[timestep] = torch.squeeze(torch.tensor(reward)).to(agent.device)
+                ents[timestep] = entropy.to(agent.device)
                 mask[timestep] = torch.tensor(1 - done).to(agent.device)
 
             advantage = agent.calculate_gae(
@@ -267,82 +264,81 @@ class Agent(nn.Module):
             ## Plotting
         np.stack(advantages)
         np.stack(entropies)
-        np.save("returns_ppo.npy", np.array(env_wrapper.return_queue))
-        np.save("advantages_ppo.npy", advantages)
-        np.save("entropies_ppo.npy", entropies)
+        np.save(f"returns_{fname}_ppo.npy", np.array(env_wrapper.return_queue))
+        np.save(f"advantages_{fname}_ppo.npy", advantages)
+        np.save(f"entropies_{fname}_ppo.npy", entropies)
 
         return agent.cpu()
 
+    @staticmethod
+    def a2c_train(
+        env_name: str,
+        hyp: A2CHyperParameters,
+        **env_kwargs,
+    ) -> nn.Module:
+        """Trains an agent using Actor Critic. Saves returns and entropy.
 
-@staticmethod
-def a2c_train(
-    env_name: str,
-    hyp: A2CHyperParameters,
-    **env_kwargs,
-) -> nn.Module:
-    """Trains an agent using Actor Critic. Saves returns and entropy.
+        Args:
+            env_name: The environment for training.
+            hyp: The hyperparameters for training
 
-    Args:
-        env_name: The environment for training.
-        hyp: The hyperparameters for training
+        Returns:
+            The trained agent.
+        """
 
-    Returns:
-        The trained agent.
-    """
-
-    envs = gym.vector.make(
-        env_name,
-        num_envs=hyp.num_envs,
-        *env_kwargs,
-    )
-    agent = Agent(envs)
-    env_wrapper = RecordEpisodeStatistics(
-        envs, deque_size=hyp.num_envs * hyp.num_timesteps
-    )
-
-    advantages = []
-    entropies = []
-    states, _ = env_wrapper.reset(seed=hyp.seed)
-
-    for _ in tqdm(range(hyp.num_episodes)):
-        rewards = torch.zeros((hyp.num_timesteps, hyp.num_envs)).to(agent.device)
-        value_estimates = torch.zeros_like(rewards).to(agent.device)
-        action_log_probs = torch.zeros_like(rewards).to(agent.device)
-        ents = torch.zeros_like(rewards).to(agent.device)
-        mask = torch.zeros_like(rewards).to(agent.device)
-
-        for timestep in range(hyp.num_timesteps):
-            actions, log_probs, values, entropy = agent.get_action(states)
-
-            states, reward, done, _, _ = env_wrapper.step(actions.cpu().numpy())
-
-            ents[timestep] = entropy.to(agent.device)
-            value_estimates[timestep] = values.squeeze().to(agent.device)
-            action_log_probs[timestep] = log_probs.to(agent.device)
-
-            rewards[timestep] = torch.squeeze(torch.tensor(reward)).to(agent.device)
-            mask[timestep] = torch.tensor(1 - done).to(agent.device)
-
-        advantage = agent.calculate_gae(
-            rewards,
-            value_estimates,
-            mask,
-            gamma=hyp.gamma,
-            lambda_=hyp.td_lambda_lambda,
+        envs = gym.vector.make(
+            env_name,
+            num_envs=hyp.num_envs,
+            *env_kwargs,
+        )
+        agent = Agent(envs)
+        env_wrapper = RecordEpisodeStatistics(
+            envs, deque_size=hyp.num_envs * hyp.num_timesteps
         )
 
-        agent.update(advantage, action_log_probs, ents.mean(), hyp.entropy_coef)
+        advantages = []
+        entropies = []
+        states, _ = env_wrapper.reset(seed=hyp.seed)
 
-        advantages.append(advantage.detach().cpu().numpy())
-        entropies.append(ents.detach().cpu().numpy())
+        for _ in tqdm(range(hyp.num_episodes)):
+            rewards = torch.zeros((hyp.num_timesteps, hyp.num_envs)).to(agent.device)
+            value_estimates = torch.zeros_like(rewards).to(agent.device)
+            action_log_probs = torch.zeros_like(rewards).to(agent.device)
+            ents = torch.zeros_like(rewards).to(agent.device)
+            mask = torch.zeros_like(rewards).to(agent.device)
 
-    np.stack(advantages)
-    np.stack(entropies)
-    np.save("returns.npy", np.array(env_wrapper.return_queue))
-    np.save("advantages.npy", advantages)
-    np.save("entropies.npy", entropies)
+            for timestep in range(hyp.num_timesteps):
+                actions, log_probs, values, entropy = agent.get_action(states)
 
-    return agent.cpu()
+                states, reward, done, _, _ = env_wrapper.step(actions.cpu().numpy())
+
+                ents[timestep] = entropy.to(agent.device)
+                value_estimates[timestep] = values.squeeze().to(agent.device)
+                action_log_probs[timestep] = log_probs.to(agent.device)
+
+                rewards[timestep] = torch.squeeze(torch.tensor(reward)).to(agent.device)
+                mask[timestep] = torch.tensor(1 - done).to(agent.device)
+
+            advantage = agent.calculate_gae(
+                rewards,
+                value_estimates,
+                mask,
+                gamma=hyp.gamma,
+                lambda_=hyp.td_lambda_lambda,
+            )
+
+            agent.update(advantage, action_log_probs, ents.mean(), hyp.entropy_coef)
+
+            advantages.append(advantage.detach().cpu().numpy())
+            entropies.append(ents.detach().cpu().numpy())
+
+        np.stack(advantages)
+        np.stack(entropies)
+        np.save("returns.npy", np.array(env_wrapper.return_queue))
+        np.save("advantages.npy", advantages)
+        np.save("entropies.npy", entropies)
+
+        return agent.cpu()
 
 
 @dataclass
