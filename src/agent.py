@@ -1,5 +1,9 @@
 """
 Agent class for actor critic methods.
+
+
+True abstraction over heads of the neural networks are distrubutions, as 
+we define some stochastic policy. 
 """
 # pylint: disable=no-member
 # pylint: disable=not-callable
@@ -12,11 +16,69 @@ from typing import Any, Tuple
 import gymnasium as gym
 import numpy as np
 import torch
-from gymnasium.vector import VectorEnv
 from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
 from torch import nn, optim
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Distribution, Normal
+from torch.nn import functional as F
 from tqdm import tqdm
+
+
+class OneHotEncoder(nn.Module):
+    """
+    Layer to do one_hot encoding of discrete vector inputs.
+    """
+
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.num_classes = num_classes
+
+    def forward(self, integers: torch.Tensor) -> torch.Tensor:
+        return (
+            F.one_hot(integers.long(), num_classes=self.num_classes).float().flatten()
+        )
+
+
+class ContinousHead(nn.Module):
+    """
+    Layer for continuous action spaces.
+
+    No covariance, just a diagonal matrix.
+
+    Includes a linear layer to map the input to the output dimention.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+    def forward(self, x: torch.Tensor) -> Distribution:
+        mean = nn.Linear(self.in_dim, self.out_dim)(x)
+        sigma = nn.Linear(self.in_dim, self.out_dim)(x).exp()
+        return Normal(mean, sigma)
+
+
+class DiscreteHead(nn.Module):
+    """
+    Layer for discrete action spaces.
+
+    Softmax for multivariate head.
+
+    Includes a linear layer to map the input to the output dimention.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+    def forward(self, x: torch.Tensor) -> Distribution:
+        logits = nn.Linear(self.in_dim, self.out_dim)(x)
+        return Categorical(logits=logits)
+
+
+class RLEnvironmentError(Exception):
+    """Raised when the environment is not supported."""
 
 
 class Agent(nn.Module):
@@ -25,23 +87,27 @@ class Agent(nn.Module):
     discrete action spaces.
     """
 
-    def __init__(self, envs: VectorEnv):
+    def __init__(self, observation_space: gym.Space, action_space: gym.Space):
         super().__init__()
         self.internal_dim = 64
-        self.num_envs = envs.num_envs
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # R^observation_space -> R^action_space
+
+        match observation_space.shape:
+            case ():
+                self.input_dim = int(np.prod(observation_space.shape))
+            case None:
+                raise RLEnvironmentError("Environment must have shape supported.")
+
         self.actor: nn.Module = nn.Sequential(
-            nn.Linear(np.prod(envs.single_observation_space.shape), self.internal_dim),
+            nn.Linear(self.input_dim, self.internal_dim),
             nn.Tanh(),
             nn.Linear(self.internal_dim, self.internal_dim),
             nn.Tanh(),
-            nn.Linear(self.internal_dim, envs.single_action_space.n),
+            self._out_space_to_head(action_space, self.internal_dim),
         ).to(self.device)
 
-        # R^observation_space -> R
         self.critic: nn.Module = nn.Sequential(
-            nn.Linear(np.prod(envs.single_observation_space.shape), self.internal_dim),
+            nn.Linear(self.input_dim, self.internal_dim),
             nn.Tanh(),
             nn.Linear(self.internal_dim, self.internal_dim),
             nn.Tanh(),
@@ -51,12 +117,40 @@ class Agent(nn.Module):
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=1e-3)
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=1e-3)
 
-    def forward(self, states: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _out_space_to_head(space: gym.Space, internal_dim: int) -> nn.Module:
+        """Returns a input layer, that maps the observation_space
+        to the internal_dim.
+
+        If the action space is discrete then the head of the model is
+        a softmax.
+
+        If the action space is continuous, then the head of the model is a gaussian.
+
+
+        Args:
+            space: The observation space of the environment.
+            internal_dim: The dimension of the internal layer.
+        Returns:
+            head: The input layer.
+
+        Raises:
+            NotImplementedError: If the space is not discrete or continuous.
+        """
+        match space:
+            case gym.spaces.Box:
+                return ContinousHead(internal_dim, np.array(space.shape).prod())
+            case gym.spaces.Discrete:
+                return DiscreteHead(internal_dim, np.array(space.shape).prod())
+            case _:
+                raise NotImplementedError("Only Box and Discrete spaces are supported.")
+
+    def forward(self, states: Any) -> Tuple[Distribution, torch.Tensor]:
         """Forward pass returns the action logits and state values."""
         states = torch.tensor(states).to(self.device)
         state_values = self.critic(states)
-        action_logits = self.actor(states)
-        return action_logits, state_values
+        action_dist = self.actor(states)
+        return action_dist, state_values
 
     def get_action(
         self, states: np.ndarray
@@ -73,18 +167,11 @@ class Agent(nn.Module):
             state_values: Tensor of state values: (batch_size, 1)
             entropy: Tensor of entropy values: (batch_size, 1)
         """
-        action_logits, state_values = self.forward(states)
-        action_dist = Categorical(logits=action_logits)
+        action_dist, state_values = self.forward(states)
         actions = action_dist.sample()
         log_probs = action_dist.log_prob(actions)
         entropy = action_dist.entropy()
-        assert actions.shape[0] == self.num_envs
         return actions, log_probs, state_values, entropy
-
-    @staticmethod
-    def get_action_probs(action_logits: torch.Tensor, actions: torch.Tensor):
-        action_dist = Categorical(logits=action_logits)
-        return action_dist.log_prob(actions)
 
     def calculate_gae(  # pylint: disable=too-many-arguments
         self,
@@ -100,8 +187,8 @@ class Agent(nn.Module):
             action_log_probs: Tensor of log probabilities of the actions: (batch_size).
             values: Tensor of state values: (batch_size, timestep).
             entropy: Tensor of entropy values: (batch_size, timestep).
-            masks: Tensor of masks: (batch_size, timestep), 1 if the episode is not done,
-            0 otherwise.
+            masks: Tensor of masks: (batch_size, timestep), 1 if the episode is not
+            done, 0 otherwise.
             gamma: The discount factor for the mdp.
             lambda_: The lambda parameter for TD(lambda), controls the amount of
             bias/variance.
@@ -133,7 +220,8 @@ class Agent(nn.Module):
         """Updates the agent's policy using gae actor critic.
         Args:
             advantages: Tensor of advantages: (batch_size, timestep).
-            action_log_probs: Tensor of log probabilities of the actions: (batch_size, timestep).
+            action_log_probs: Tensor of log probabilities of the actions:
+            (batch_size, timestep).
 
         """
 
@@ -171,8 +259,6 @@ class Agent(nn.Module):
         square_td_errors.backward()
         self.critic_opt.step()
         self.actor_opt.zero_grad()
-
-        # Semi-gradient update for actor network
 
         ratio = torch.exp(action_log_probs - old_log_probs)
         clipped_ratio = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
@@ -215,7 +301,10 @@ class Agent(nn.Module):
             envs, deque_size=hyp.num_envs * hyp.num_timesteps
         )
 
-        agent = Agent(envs)
+        agent = Agent(
+            envs.observation_space,
+            envs.action_space,
+        )
 
         advantages = []
         entropies = []
@@ -233,10 +322,7 @@ class Agent(nn.Module):
 
             for timestep in range(hyp.num_timesteps):
                 actions, log_probs, values, entropy = agent.get_action(states)
-                old_log_probs = Categorical(
-                    logits=old_actor(torch.Tensor(states).to(agent.device))
-                ).log_prob(actions)
-
+                old_log_probs = old_actor(states).log_prob(actions)
                 states, reward, done, _, _ = env_wrapper.step(actions.cpu().numpy())
 
                 rewards[timestep] = torch.squeeze(torch.tensor(reward)).to(agent.device)
@@ -261,7 +347,6 @@ class Agent(nn.Module):
             advantages.append(advantage.detach().cpu().numpy())
             entropies.append(ents.detach().cpu().numpy())
 
-            ## Plotting
         np.stack(advantages)
         np.stack(entropies)
         np.save(f"returns_{fname}_ppo.npy", np.array(env_wrapper.return_queue))
@@ -291,7 +376,7 @@ class Agent(nn.Module):
             num_envs=hyp.num_envs,
             *env_kwargs,
         )
-        agent = Agent(envs)
+        agent: Agent = Agent(envs.single_observation_space, envs.single_action_space)
         env_wrapper = RecordEpisodeStatistics(
             envs, deque_size=hyp.num_envs * hyp.num_timesteps
         )
@@ -312,11 +397,10 @@ class Agent(nn.Module):
 
                 states, reward, done, _, _ = env_wrapper.step(actions.cpu().numpy())
 
-                ents[timestep] = entropy.to(agent.device)
+                rewards[timestep] = torch.squeeze(torch.tensor(reward)).to(agent.device)
                 value_estimates[timestep] = values.squeeze().to(agent.device)
                 action_log_probs[timestep] = log_probs.to(agent.device)
-
-                rewards[timestep] = torch.squeeze(torch.tensor(reward)).to(agent.device)
+                ents[timestep] = entropy.to(agent.device)
                 mask[timestep] = torch.tensor(1 - done).to(agent.device)
 
             advantage = agent.calculate_gae(
@@ -327,7 +411,7 @@ class Agent(nn.Module):
                 lambda_=hyp.td_lambda_lambda,
             )
 
-            agent.update(advantage, action_log_probs, ents.mean(), hyp.entropy_coef)
+            agent.a2c_update(advantage, action_log_probs, ents.mean(), hyp.entropy_coef)
 
             advantages.append(advantage.detach().cpu().numpy())
             entropies.append(ents.detach().cpu().numpy())
