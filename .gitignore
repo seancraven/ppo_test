@@ -1,4 +1,4 @@
 *.npy
 /.vscode
 *.png
-*.pyc
+**__pycache__/
