@@ -11,14 +11,19 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, Tuple
+from typing import Any
+from typing import Protocol
+from typing import Tuple
 
 import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
-from torch import nn, optim
-from torch.distributions import Categorical, Distribution, Normal
+from torch import nn
+from torch import optim
+from torch.distributions import Categorical
+from torch.distributions import Distribution
+from torch.distributions import Normal
 from torch.nn import functional as F
 from tqdm import tqdm
 
@@ -100,23 +105,21 @@ class Actor(nn.Module):
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.head = self._out_space_to_head(action_space)
         self.internal_dim = internal_dim
 
-        self.actor_head = self.head(
-            self.internal_dim, int(np.array(action_space.shape).prod())
+        self.net = nn.Sequential(
+            nn.Linear(self.input_dim, self.internal_dim),
+            nn.ReLU(),
+            nn.Linear(self.internal_dim, self.internal_dim),
+            nn.ReLU(),
+            self._out_space_to_head(action_space),
         )
-        self.actor_1 = nn.Linear(self.input_dim, self.internal_dim)
-        self.actor_2 = nn.Linear(self.internal_dim, self.internal_dim)
 
     def forward(self, states: torch.Tensor) -> Distribution:
-        states = torch.Tensor(states).reshape(states.shape[0], -1).to(self.device)
-        states = F.relu(self.actor_1(states))
-        states = F.relu(self.actor_2(states))
-        return self.actor_head(states)
+        states = torch.Tensor(states).reshape(-1, self.input_dim).to(self.device)
+        return self.net(states)
 
-    @staticmethod
-    def _out_space_to_head(space: gym.Space) -> Callable:
+    def _out_space_to_head(self, space: gym.Space) -> nn.Module:
         """Returns a input layer, that maps the observation_space
         to the internal_dim.
 
@@ -132,14 +135,14 @@ class Actor(nn.Module):
         Returns:
             head: The input layer.
 
-        Raises:
+
             NotImplementedError: If the space is not discrete or continuous.
         """
         match space:
             case gym.spaces.Box():
-                return ContinousHead
+                return ContinousHead(self.internal_dim, int(np.prod(space.shape)))
             case gym.spaces.Discrete():
-                return DiscreteHead
+                return DiscreteHead(self.internal_dim, int(space.n))
             case _:
                 print(space)
                 raise NotImplementedError("Only Box and Discrete spaces are supported.")
@@ -177,12 +180,12 @@ class Agent(nn.Module):
         ).to(self.device)
 
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=1e-3)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=1e-3)
+        self.critic_opt = optim.Adam(self.critic.parameters(), lr=5e-3)
 
     def forward(self, states: Any) -> Tuple[Distribution, torch.Tensor]:
         """Forward pass returns the action logits and state values."""
 
-        states = torch.tensor(states).reshape(states.shape[0], -1).to(self.device)
+        states = torch.tensor(states).reshape(-1, self.input_dim).to(self.device)
         state_values = self.critic(states)
         action_dist = self.actor(states)
         return action_dist, state_values
@@ -267,7 +270,7 @@ class Agent(nn.Module):
 
         self.actor_opt.zero_grad()
         actor_loss = (
-            -(advantages.detach() * action_log_probs).mean() - ent_coef * entropy
+            -(advantages.detach() * action_log_probs).mean() - ent_coef * entropy.mean()
         )
         actor_loss.backward()
         self.actor_opt.step()
@@ -313,7 +316,7 @@ class Agent(nn.Module):
     @staticmethod
     def train_agent(
         env_name: str,
-        hyp: AgentTrainingParameters,
+        training: AgentTrainingParameters,
         dir_name: str = "",
         **env_kwargs,
     ) -> nn.Module:
@@ -329,11 +332,12 @@ class Agent(nn.Module):
 
         envs = gym.vector.make(
             env_name,
-            num_envs=hyp.num_envs,
+            num_envs=training.num_envs,
+            asynchronous=False,
             **env_kwargs,
         )
         env_wrapper = RecordEpisodeStatistics(
-            envs, deque_size=hyp.num_envs * hyp.num_timesteps
+            envs, deque_size=training.num_envs * training.num_episodes
         )
 
         agent = Agent(
@@ -343,20 +347,24 @@ class Agent(nn.Module):
 
         advantages = []
         entropies = []
-        states, _ = env_wrapper.reset(seed=hyp.seed)
 
-        for _ in tqdm(range(hyp.num_episodes)):
-            states, advantage, ents = hyp.episode(states, agent, hyp, env_wrapper)
+        states, _ = env_wrapper.reset(seed=training.seed)
+
+        for _ in tqdm(range(training.num_episodes)):
+            states, advantage, ents = training.episode(
+                states, agent, training, env_wrapper
+            )
             advantages.append(advantage.detach().cpu().numpy())
             entropies.append(ents.detach().cpu().numpy())
 
         np.stack(advantages)
         np.stack(entropies)
         np.save(
-            f"{dir_name}/{hyp.seed}_returns.npy", np.array(env_wrapper.return_queue)
+            f"{dir_name}/{training.seed}_returns.npy",
+            np.array(env_wrapper.return_queue),
         )
-        np.save(f"{dir_name}/{hyp.seed}_advantages.npy", advantages)
-        np.save(f"{dir_name}/{hyp.seed}_entropies.npy", entropies)
+        np.save(f"{dir_name}/{training.seed}_advantages.npy", advantages)
+        np.save(f"{dir_name}/{training.seed}_entropies.npy", entropies)
 
         return agent.cpu()
 
@@ -366,12 +374,14 @@ class AgentTrainingParameters(Protocol):
     """Hyperparametrs for the agent, with default values"""
 
     update_name: str
-    num_episodes: int = 100
-    num_envs: int = 16
+    num_episodes: int = 1000
+    num_envs: int = 10
     num_timesteps: int = 128
     seed: int = 0
     td_lambda_lambda: float = 0.95
     gamma: float = 0.99
+    actor_lr: float = 0.001
+    critic_lr: float = 0.005
 
     @staticmethod
     def episode(
@@ -438,7 +448,7 @@ class PPOTraining(AgentTrainingParameters):
 class A2CTraining(AgentTrainingParameters):
     """Hyperparametrs for A2C training, with default values"""
 
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.1
     update_name: str = "a2c"
 
     @staticmethod
@@ -475,4 +485,5 @@ class A2CTraining(AgentTrainingParameters):
             gamma=hyp.gamma,
             lambda_=hyp.td_lambda_lambda,
         )
+        agent.a2c_update(advantage, action_log_probs, entropy.mean(), hyp.entropy_coef)
         return states, advantage, ents
