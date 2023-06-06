@@ -28,7 +28,7 @@ from src.agent import Agent  # pyright: ignore
 def train_agent(
     agent: Agent,
     envs: gym.vector.VectorEnv,
-    training: AgentTrainingParameters,
+    training: AgentTraining,
     dir_name: str = "",
 ) -> nn.Module:
     """Trains an agent using update function. Saves returns and entropy.
@@ -70,7 +70,7 @@ def train_agent(
 
 
 @dataclass
-class AgentTrainingParameters(Protocol):
+class AgentTraining(Protocol):
     """Container for general training hyperparameters, and training behaviour."""
 
     update_name: str
@@ -86,7 +86,7 @@ class AgentTrainingParameters(Protocol):
     def episode(
         states: np.ndarray,
         agent: Agent,
-        hyp: AgentTrainingParameters,
+        hyp: AgentTraining,
         env_wrapper: RecordEpisodeStatistics,
     ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
         """Defines how experience from an episode updates the agent."""
@@ -98,7 +98,7 @@ class AgentTrainingParameters(Protocol):
         advantages: torch.Tensor,
         action_log_probs: torch.Tensor,
         old_log_probs: torch.Tensor,
-        hyperparameters: AgentTrainingParameters,
+        hyperparameters: AgentTraining,
     ):
         """Defines the how the parameter are updated for the actor critic."""
         ...
@@ -142,7 +142,7 @@ def calculate_gae(
 
 
 @dataclass
-class PPOTraining(AgentTrainingParameters):
+class PPOTraining(AgentTraining):
     """Hyperparametrs for PPO training, with default values"""
 
     epsilon: float = 0.1
@@ -235,7 +235,7 @@ class PPOTraining(AgentTrainingParameters):
 
 
 @dataclass
-class A2CTraining(AgentTrainingParameters):
+class A2CTraining(AgentTraining):
     """Hyperparametrs for A2C training, with default values"""
 
     entropy_coef: float = 0.1
