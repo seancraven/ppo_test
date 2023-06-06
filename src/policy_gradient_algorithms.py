@@ -1,10 +1,19 @@
+"""
+Each algorithm defines how the agent learns from it's experience.
+using the policy gradient techniques.
+
+Module containing the policy gradient algorithms. 
+
+Each Algorithm inherits a basic set of hyperparameters, and an inteface from
+AgentTrainingParameters. This Protocol defines how the each episode is updated
+, and contains specific hyperparameters for each algorithm.
+"""
 # pylint: disable = no-member
 from __future__ import annotations
 
-import os
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, List, Protocol, Tuple
+from typing import Protocol, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -13,31 +22,7 @@ from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
 from torch import nn
 from tqdm import tqdm
 
-from src.agent import Agent
-
-
-@dataclass
-class AgentTrainingParameters(Protocol):
-    """Hyperparametrs for the agent, with default values"""
-
-    update_name: str
-    num_episodes: int = 1000
-    num_envs: int = 10
-    num_timesteps: int = 128
-    seed: int = 0
-    td_lambda_lambda: float = 0.95
-    gamma: float = 0.99
-    lrs: Tuple[float, float] = (1e-3, 5e-4)
-
-    @staticmethod
-    def episode(
-        states: np.ndarray,
-        agent: Agent,
-        hyp: AgentTrainingParameters,
-        env_wrapper: RecordEpisodeStatistics,
-    ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
-        """Runs an episode of the environment, and updates the agent."""
-        ...
+from src.agent import Agent  # pyright: ignore
 
 
 def train_agent(
@@ -82,6 +67,41 @@ def train_agent(
     np.save(f"{dir_name}/{training.seed}_entropies.npy", entropies)
 
     return agent.cpu()
+
+
+@dataclass
+class AgentTrainingParameters(Protocol):
+    """Container for general training hyperparameters, and training behaviour."""
+
+    update_name: str
+    num_episodes: int = 1000
+    num_envs: int = 10
+    num_timesteps: int = 128
+    seed: int = 0
+    td_lambda_lambda: float = 0.95
+    gamma: float = 0.99
+    lrs: Tuple[float, float] = (1e-3, 5e-4)
+
+    @staticmethod
+    def episode(
+        states: np.ndarray,
+        agent: Agent,
+        hyp: AgentTrainingParameters,
+        env_wrapper: RecordEpisodeStatistics,
+    ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+        """Defines how experience from an episode updates the agent."""
+        ...
+
+    @staticmethod
+    def update(
+        agent: Agent,
+        advantages: torch.Tensor,
+        action_log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        hyperparameters: AgentTrainingParameters,
+    ):
+        """Defines the how the parameter are updated for the actor critic."""
+        ...
 
 
 def calculate_gae(
@@ -167,7 +187,7 @@ class PPOTraining(AgentTrainingParameters):
         )
 
         PPOTraining.update(
-            agent, advantage, action_log_probs, old_action_log_probs, hyp.epsilon
+            agent, advantage, action_log_probs, old_action_log_probs, hyp
         )
 
         return states, advantage, entropy
@@ -178,7 +198,7 @@ class PPOTraining(AgentTrainingParameters):
         advantages: torch.Tensor,
         action_log_probs: torch.Tensor,
         old_log_probs: torch.Tensor,
-        epsilon: float,
+        hyperparameters: PPOTraining,
     ):
         """Updates the agent's policy and value estimate using ppo.
 
@@ -197,7 +217,9 @@ class PPOTraining(AgentTrainingParameters):
         agent.actor_opt.zero_grad()
 
         ratio = torch.exp(action_log_probs - old_log_probs)
-        clipped_ratio = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
+        clipped_ratio = torch.clamp(
+            ratio, 1 - hyperparameters.epsilon, 1 + hyperparameters.epsilon
+        )
         actor_loss = -(
             torch.stack(
                 (advantages.detach() * clipped_ratio, advantages.detach() * ratio),
@@ -251,9 +273,7 @@ class A2CTraining(AgentTrainingParameters):
             gamma=hyp.gamma,
             lambda_=hyp.td_lambda_lambda,
         )
-        A2CTraining.update(
-            agent, advantage, action_log_probs, entropy.mean(), hyp.entropy_coef
-        )
+        A2CTraining.update(agent, advantage, action_log_probs, hyp, entropy.mean())
         return states, advantage, entropy
 
     @staticmethod
@@ -261,8 +281,8 @@ class A2CTraining(AgentTrainingParameters):
         agent: Agent,
         advantages: torch.Tensor,
         action_log_probs: torch.Tensor,
+        hyperparameters: A2CTraining,
         entropy: torch.Tensor = torch.Tensor([0]),
-        ent_coef: float = 0.01,
     ):
         """Updates the agent's policy using gae actor critic.
         Args:
@@ -279,7 +299,8 @@ class A2CTraining(AgentTrainingParameters):
 
         agent.actor_opt.zero_grad()
         actor_loss = (
-            -(advantages.detach() * action_log_probs).mean() - ent_coef * entropy.mean()
+            -(advantages.detach() * action_log_probs).mean()
+            - hyperparameters.entropy_coef * entropy.mean()
         )
         actor_loss.backward()
         agent.actor_opt.step()
