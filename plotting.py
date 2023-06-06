@@ -1,6 +1,5 @@
 """
-Need to make some files that take averages over seeds plots both the mean and std for each algo
-This should then be done for each task.
+Plotting functions for the experiments.
 """
 import os
 from typing import Callable
