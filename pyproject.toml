@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "ppo-test"
+version = "0.1.0"
+description = ""
+authors = ["seancraven <seanpietercraven@gmail.com>"]
+readme = "README.md"
+packages = [{include = "ppo_test"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pylint = "^2.17.4"
+matplotlib = "^3.7.1"
+gymnasium = "^0.28.1"
+wrapt = "^1.15.0"
+dill = "^0.3.6"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

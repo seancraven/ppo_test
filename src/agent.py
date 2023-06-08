@@ -16,20 +16,6 @@ import numpy as np
 import torch
 from torch import nn, optim
 from torch.distributions import Categorical, Distribution, Normal
-from torch.nn import functional as F
-
-
-class OneHotEncoder(nn.Module):
-    """
-    Layer to do one_hot encoding of discrete vector inputs.
-    """
-
-    def __init__(self, num_classes: int):
-        super().__init__()
-        self.num_classes = num_classes
-
-    def forward(self, integers: torch.Tensor) -> torch.Tensor:
-        return F.one_hot(integers.long(), num_classes=self.num_classes).float()
 
 
 class ContinousHead(nn.Module):
