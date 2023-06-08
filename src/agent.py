@@ -9,17 +9,13 @@ TODO:
 # pylint: disable=not-callable
 from __future__ import annotations
 
-from typing import Any
-from typing import Tuple
+from typing import Any, Tuple
 
 import gymnasium as gym
 import numpy as np
 import torch
-from torch import nn
-from torch import optim
-from torch.distributions import Categorical
-from torch.distributions import Distribution
-from torch.distributions import Normal
+from torch import nn, optim
+from torch.distributions import Categorical, Distribution, Normal
 from torch.nn import functional as F
 
 
@@ -155,6 +151,7 @@ class Agent(nn.Module):
         action_space: gym.Space,
         actor_lr: float = 1e-3,
         critic_lr: float = 5e-3,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         super().__init__()
 
@@ -166,7 +163,7 @@ class Agent(nn.Module):
                 raise RLEnvironmentError("Environment must have shape supported.")
 
         self.internal_dim = 64
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
 
         self.actor = Actor(observation_space, action_space, self.internal_dim).to(
             self.device

@@ -18,7 +18,8 @@ from typing import Protocol, Tuple
 import gymnasium as gym
 import numpy as np
 import torch
-from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
+from gymnasium.wrappers.record_episode_statistics import \
+    RecordEpisodeStatistics
 from torch import nn
 from tqdm import tqdm
 
@@ -50,7 +51,7 @@ def train_agent(
 
     states, _ = env_wrapper.reset(seed=training.seed)
 
-    for _ in tqdm(range(training.num_episodes)):
+    for _ in tqdm(range(training.num_episodes), disable=True):
         states, advantage, final_entropy = training.episode(
             states, agent, training, env_wrapper
         )

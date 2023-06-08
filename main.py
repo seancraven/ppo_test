@@ -1,19 +1,17 @@
 # pylint: disable=no-member
 """
-Script for experiments.
+Sequential training that works. I have to migrate to jax.
 """
 import os
 import random
-from typing import Dict
-from typing import List
+from typing import Dict, List
 
 import gymnasium as gym
 
 import src.policy_gradient_algorithms
 from src.agent import Agent
-from src.policy_gradient_algorithms import A2CTraining
-from src.policy_gradient_algorithms import AgentTraining
-from src.policy_gradient_algorithms import PPOTraining
+from src.policy_gradient_algorithms import (A2CTraining, AgentTraining,
+                                            PPOTraining)
 
 
 def train_agents(
@@ -42,11 +40,12 @@ def train_agents(
 
 
 if __name__ == "__main__":
-    update_list = [A2CTraining(num_envs=10), PPOTraining(num_envs=10)]
+    update_list = [
+        PPOTraining(num_envs=10),
+        A2CTraining(num_envs=10),
+    ]
     environments = {
-        "CartPole-v1": gym.vector.make("CartPole-v1", num_envs=10),
-        "LunarLander-v2": gym.vector.make("LunarLander-v2", num_envs=10),
-        "Acrobot-v1": gym.vector.make("Acrobot-v1", num_envs=10),
+        "CartPole-v1": gym.vector.make("CartPole-v1", num_envs=10, asynchronous=False),
+        "Acrobot-v1": gym.vector.make("Acrobot-v1", num_envs=10, asynchronous=False),
     }
     random_seeds = [random.randint(0, 100) for _ in range(8)]
-    train_agents(update_list, environments, random_seeds)
